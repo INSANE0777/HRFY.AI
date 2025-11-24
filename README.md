@@ -65,14 +65,113 @@ question_exposures (
 ```
 Drive anti-repetition logic using sliding windows scoped by recruiter/test purpose rather than hardcoded lists.
 
-## 5. Anti-Repetition Strategy
-1. Maintain `question_exposures` with indexed lookups on `(candidate_id, question_id)` and `(question_id, recruiter_org_id)`.
-2. Allow test templates to define repetition policy:
-   - `cooldown_days_per_candidate`
-   - `max_exposures_per_candidate`
-   - `org_rotation_depth` (e.g., question not reused until X other candidates in same org have seen it)
-3. Delivery Orchestrator fetches eligible questions via SQL filters + weighted randomization to ensure diversity across taxonomy dimensions.
-4. Provide dashboard signals (question heatmaps) for content managers to refresh overused items.
+## 5. Removing AI Fallback & Improving Question Diversity
+
+### 5.1 Eliminating LLM Question Generation
+
+**Problem**: Current system generates questions on-the-fly via LLM when question bank lacks matching content.
+
+**Solution**: Replace with deterministic, curated content pipeline:
+
+1. **Proactive Content Management**
+   - Content ops team builds question pools ahead of demand using taxonomy filters
+   - Dashboard shows "pool health" metrics: available questions per taxonomy combination
+   - Alerts trigger when pool size drops below threshold (e.g., <50 questions for a skill+difficulty combo)
+
+2. **Fail-Safe Behavior (No LLM)**
+   - If Delivery Orchestrator cannot find enough eligible questions:
+     - **Assessment tests**: Return error to recruiter with specific pool gaps; test creation blocked until content is added
+     - **Practice tests**: Gracefully reduce question count or suggest alternative taxonomy filters
+   - System never generates questions automatically; all content must be pre-approved
+
+3. **Content Expansion Workflow**
+   - When pool shortage detected → Content ops receives prioritized backlog
+   - SMEs author questions in bulk using taxonomy templates
+   - Questions go through review → publish pipeline before becoming available
+   - Historical tracking ensures we can predict demand patterns and scale pools proactively
+
+### 5.2 Enhanced Anti-Repetition System (Beyond 5-Candidate Limit)
+
+**Current Limitation**: `last_used_for_candidates` stores only 5 candidate IDs, oldest removed when limit reached.
+
+**New Approach**: Time-based sliding windows + configurable policies + multi-dimensional tracking
+
+1. **Question Exposures Audit Table**
+   ```
+   question_exposures (
+     id UUID,
+     question_id UUID,
+     candidate_id UUID,
+     test_instance_id UUID,
+     recruiter_org_id UUID,  -- NEW: org-level tracking
+     used_at TIMESTAMP,
+     outcome {viewed, answered},
+     result {correct, incorrect, skipped}
+   )
+   ```
+   - **Indexes**: `(candidate_id, question_id, used_at)`, `(question_id, recruiter_org_id, used_at)`
+   - Stores complete history (not just last 5), enabling flexible query patterns
+
+2. **Configurable Repetition Policies** (per test template)
+   ```json
+   {
+     "repetition_policy": {
+       "cooldown_days_per_candidate": 90,        // Question not shown to same candidate for 90 days
+       "max_exposures_per_candidate": 3,         // Max 3 times ever per candidate
+       "org_rotation_depth": 20,                 // Question not reused until 20 other candidates in org have seen it
+       "global_cooldown_days": 7,                // Question not reused globally for 7 days (optional)
+       "enforce_taxonomy_diversity": true        // Prefer questions from underrepresented taxonomy tags
+     }
+   }
+   ```
+
+3. **Query Logic for Question Selection**
+   ```sql
+   -- Example: Find eligible questions for a candidate
+   WITH candidate_exposures AS (
+     SELECT question_id, MAX(used_at) as last_used
+     FROM question_exposures
+     WHERE candidate_id = :candidate_id
+     GROUP BY question_id
+   ),
+   org_exposures AS (
+     SELECT question_id, COUNT(DISTINCT candidate_id) as exposure_count
+     FROM question_exposures
+     WHERE recruiter_org_id = :org_id
+       AND used_at > NOW() - INTERVAL '30 days'
+     GROUP BY question_id
+   )
+   SELECT q.*
+   FROM questions q
+   JOIN question_taxonomy qt ON qt.question_id = q.id
+   LEFT JOIN candidate_exposures ce ON ce.question_id = q.id
+   LEFT JOIN org_exposures oe ON oe.question_id = q.id
+   WHERE q.status = 'published'
+     AND matches_section_filters(qt, :section)
+     -- Candidate-level checks
+     AND (ce.last_used IS NULL 
+          OR ce.last_used < NOW() - INTERVAL ':cooldown_days days'
+          OR (SELECT COUNT(*) FROM question_exposures 
+              WHERE question_id = q.id AND candidate_id = :candidate_id) < :max_exposures)
+     -- Org-level rotation
+     AND (oe.exposure_count IS NULL OR oe.exposure_count < :org_rotation_depth)
+   ORDER BY 
+     diversity_weight(q, :section),  -- Prefer questions from underrepresented taxonomy tags
+     RANDOM()  -- Randomize within eligible pool
+   LIMIT :question_count;
+   ```
+
+4. **Benefits Over Old System**
+   - **No hard limit**: Can track unlimited candidate history
+   - **Time-based**: Questions become eligible again after cooldown period
+   - **Org-aware**: Prevents question leakage across recruiter organizations
+   - **Configurable**: Each test type can have different repetition rules
+   - **Analytics-driven**: Heatmaps show which questions are overused, enabling proactive content refresh
+
+5. **Monitoring & Alerts**
+   - Dashboard shows: "Questions approaching repetition limits" (e.g., 80% of candidates in org have seen this)
+   - Automated alerts when pool becomes too constrained by repetition rules
+   - Content ops can bulk-retire overused questions and add fresh content
 
 ## 6. Configuration Model
 `test_templates` table fields:

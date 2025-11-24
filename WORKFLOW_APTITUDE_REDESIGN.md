@@ -19,23 +19,15 @@
 
 ## 3. Test Generation
 1. Recruiter triggers **Assessment Run** (invite) or candidate self-initiates **Practice Run**.  
-2. Delivery Orchestrator requests section-wise question pools from Question Service using template filters and repetition constraints:
-   ```
-   SELECT q.*
-   FROM questions q
-   JOIN question_taxonomy qt ON qt.question_id = q.id
-   WHERE q.status = 'published'
-     AND matches_section_filters(qt, section)
-     AND NOT EXISTS (
-         SELECT 1 FROM question_exposures qe
-         WHERE qe.question_id = q.id
-           AND qe.candidate_id = :candidate_id
-           AND qe.used_at > NOW() - INTERVAL 'cooldown_days'
-     )
-   ORDER BY diversity_weight(q, section)
-   LIMIT section.question_count;
-   ```
-3. Selected questions + template snapshot compose a `test_instance` saved with seed metadata for deterministic recreation.
+2. **Pre-flight Validation**: Orchestrator checks pool availability for each section using template's repetition policy. If insufficient, test creation fails with specific gap report (see Section 5.2).
+3. **Question Selection**: Delivery Orchestrator requests section-wise question pools from Question Service:
+   - Applies taxonomy filters (skill, difficulty, test type, etc.)
+   - Enforces candidate-level repetition: cooldown days + max exposures per candidate
+   - Enforces org-level rotation: question not reused until X other candidates in org have seen it
+   - Applies diversity weighting: prefer questions from underrepresented taxonomy tags
+   - Randomizes within eligible pool
+4. Selected questions + template snapshot compose a `test_instance` saved with seed metadata for deterministic recreation.
+5. **Immediate Exposure Logging**: As questions are assigned, `question_exposures` records created with `outcome='viewed'` to prevent reuse in same session.
 
 ## 4. Test Delivery
 1. Candidate authenticates → receives secure test session token.  
@@ -44,9 +36,32 @@
 4. User responses streamed back in real-time to maintain progress restore capability.
 
 ## 5. Anti-Repetition Enforcement During Delivery
-- For every question served, Delivery Orchestrator immediately inserts a `question_exposures` record with `outcome='viewed'`.  
-- On answer submission, record is updated with `result`.  
-- If orchestrator cannot find enough eligible questions, it surfaces a template-level alert so content ops can expand the pool or relax filters—no LLM fallback.
+
+### 5.1 Exposure Tracking
+- For every question served, Delivery Orchestrator immediately inserts a `question_exposures` record with `outcome='viewed'` and `recruiter_org_id`.  
+- On answer submission, record is updated with `outcome='answered'` and `result` (correct/incorrect/skipped).  
+- All exposures are permanently logged (no 5-candidate limit); queries use time-based windows and configurable policies.
+
+### 5.2 Handling Pool Shortages (No LLM Fallback)
+**When eligible questions are insufficient:**
+
+1. **Pre-flight Check** (before test instance creation):
+   - Orchestrator queries available pool size for each section
+   - If pool < required questions × 1.5 (safety margin), test creation is **blocked**
+   - Recruiter receives error: *"Insufficient questions for 'DSA - Hard' section. Available: 12, Required: 20. Please contact content team or adjust filters."*
+
+2. **During Test Generation** (edge case):
+   - If pool shrinks between pre-flight and generation (rare race condition):
+     - **Assessment tests**: Fail gracefully, notify recruiter, allow retry after content expansion
+     - **Practice tests**: Reduce question count to available pool, show message: *"Showing 15 of 20 requested questions due to availability"*
+
+3. **Content Team Workflow**:
+   - Pool shortage alerts → Content ops dashboard
+   - Priority queue shows: `[High] DSA + Hard: 12 available, 20 needed`
+   - SMEs bulk-author questions matching taxonomy
+   - Once published, test creation automatically unblocks
+
+**Key Principle**: System never generates questions. All content must be human-reviewed and published before use.
 
 ## 6. Scoring & Reporting
 1. Upon submission, Scoring Service applies section-specific policies (negative marking, psychometric scaling, adaptive weights).  
